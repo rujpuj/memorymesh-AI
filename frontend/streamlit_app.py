@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 from html import escape
+from pathlib import Path
+import sys
 
-import requests
 import streamlit as st
+
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from app.compressor import compress_memory
+from app.learner import CorrectionLearner
+from app.memory import MemoryStore
+from app.retriever import MemoryRetriever
 
 
 st.set_page_config(page_title="MemoryMesh AI", page_icon="M", layout="wide")
@@ -369,16 +380,10 @@ div[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
 """
 
 
-def api_get(path: str) -> requests.Response:
-    response = requests.get(f"{API_URL}{path}", timeout=10)
-    response.raise_for_status()
-    return response
-
-
-def api_post(path: str, payload: dict) -> requests.Response:
-    response = requests.post(f"{API_URL}{path}", json=payload, timeout=10)
-    response.raise_for_status()
-    return response
+@st.cache_resource
+def get_services() -> tuple[MemoryStore, MemoryRetriever, CorrectionLearner]:
+    store = MemoryStore()
+    return store, MemoryRetriever(store), CorrectionLearner()
 
 
 def render_hero(memory_count: int, correction_count: int, ai_gif_url: str) -> None:
@@ -435,28 +440,17 @@ def section_intro(kicker: str, title: str, copy: str) -> None:
 
 with st.sidebar:
     st.markdown("### Control Room")
-    API_URL = st.text_input("API URL", "http://localhost:8000")
+    st.success("Single-app deploy mode")
     ai_gif_url = st.text_input(
         "AI GIF URL",
         "",
         placeholder="Paste a Giphy, Tenor, or .gif URL",
         help="Use a direct animated GIF URL to brand the hero panel. Leave blank for the built-in AI animation.",
     )
-    try:
-        api_get("/health")
-        st.success("Backend online")
-    except requests.RequestException:
-        st.warning("Backend not reachable")
 
-try:
-    memories = api_get("/memories").json()
-except requests.RequestException:
-    memories = []
-
-try:
-    corrections = api_get("/corrections").json()
-except requests.RequestException:
-    corrections = []
+store, retriever, learner = get_services()
+memories = [memory.__dict__ for memory in store.list()]
+corrections = learner.list_corrections()
 
 st.markdown(CSS, unsafe_allow_html=True)
 render_hero(memory_count=len(memories), correction_count=len(corrections), ai_gif_url=ai_gif_url)
@@ -480,16 +474,15 @@ with memory_tab:
 
     if save_clicked:
         try:
-            api_post("/memories", {"content": content, "importance": importance})
+            compressed = compress_memory(content)
+            store.add(content=content, compressed=compressed, importance=importance)
             st.success("Memory saved.")
-        except requests.RequestException as exc:
+            st.rerun()
+        except ValueError as exc:
             st.error(f"Could not save memory: {exc}")
 
     if st.button("Refresh memories", use_container_width=True):
-        try:
-            memories = api_get("/memories").json()
-        except requests.RequestException as exc:
-            st.error(f"Could not load memories: {exc}")
+        st.rerun()
 
     if memories:
         st.dataframe(memories, use_container_width=True, hide_index=True)
@@ -509,12 +502,10 @@ with retrieve_tab:
         limit = st.number_input("Limit", min_value=1, max_value=25, value=5)
 
     if st.button("Retrieve context", type="primary", use_container_width=True):
-        try:
-            result = api_post("/retrieve", {"query": query, "limit": limit}).json()
-            st.code(result["context"] or "No matching memories yet.", language="text")
-            st.dataframe(result["memories"], use_container_width=True, hide_index=True)
-        except requests.RequestException as exc:
-            st.error(f"Could not retrieve context: {exc}")
+        results = retriever.retrieve(query=query, limit=limit)
+        context = retriever.context_block(query=query, limit=limit)
+        st.code(context or "No matching memories yet.", language="text")
+        st.dataframe([memory.__dict__ for memory in results], use_container_width=True, hide_index=True)
 
 with corrections_tab:
     section_intro(
@@ -526,11 +517,6 @@ with corrections_tab:
     answer = st.text_area("Answer", height=110)
     correction = st.text_area("Correction", height=110)
     if st.button("Save correction", type="primary", use_container_width=True):
-        try:
-            api_post(
-                "/corrections",
-                {"prompt": prompt, "answer": answer, "correction": correction},
-            )
-            st.success("Correction saved.")
-        except requests.RequestException as exc:
-            st.error(f"Could not save correction: {exc}")
+        learner.add_correction(prompt=prompt, answer=answer, correction=correction)
+        st.success("Correction saved.")
+        st.rerun()
